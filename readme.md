@@ -12,7 +12,8 @@
 - ✅ 支持有损/无损压缩
 - ✅ 支持自定义输出目录，**不覆盖原文件**
 - ✅ 跳过已转换的文件（--skip-existing）
-- ✅ 保留目录结构（--preserve-structure）
+- ✅ 默认保留目录结构（使用 `--flat` 禁用）
+- ✅ 未处理的 WebP 文件自动复制到输出目录
 - ✅ 支持多种输入格式：PNG, JPG, JPEG, BMP, TIFF, WebP
 
 ## 安装依赖
@@ -39,8 +40,8 @@ python ImageCompress.py ./images --quality 85
 # 无损压缩
 python ImageCompress.py ./images --lossless
 
-# 保留目录结构
-python ImageCompress.py ./images --output ./webp_output --preserve-structure
+# 不保留目录结构（所有文件输出到同一目录）
+python ImageCompress.py ./images --output ./webp_output --flat
 
 # 跳过已存在的文件
 python ImageCompress.py ./images --skip-existing
@@ -50,6 +51,9 @@ python ImageCompress.py ./images --dry-run
 
 # 转换单个文件
 python ImageCompress.py single.png --output .
+
+# 转换时自动复制已存在的 WebP 文件到输出目录
+python ImageCompress.py ./images --output ./webp_output
 ```
 
 ## 参数说明
@@ -63,7 +67,7 @@ python ImageCompress.py single.png --output .
 | `-m, --method` | 压缩方法 0-6（默认：6，压缩率最高） |
 | `--no-recursive` | 不递归扫描子目录 |
 | `--skip-existing` | 跳过已存在的目标文件 |
-| `--preserve-structure` | 在输出目录中保留输入目录结构 |
+| `--flat` | 不保留目录结构，所有文件输出到同一目录 |
 | `--bg-color` | RGBA 转 RGB 时的背景色，格式 R,G,B（默认：255,255,255） |
 | `--dry-run` | 仅扫描预览，不执行转换 |
 

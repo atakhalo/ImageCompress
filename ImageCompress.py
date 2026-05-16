@@ -24,6 +24,7 @@ import sys
 import json
 import argparse
 import glob
+import shutil
 from pathlib import Path
 
 from PIL import Image, PngImagePlugin
@@ -206,6 +207,59 @@ def build_exif_from_metadata(metadata: dict) -> dict:
 
 
 # ============================================================
+#  文件时间戳保留
+# ============================================================
+
+def preserve_timestamps(src_path: str, dst_path: str):
+    """
+    将 src_path 的创建时间和修改时间复制到 dst_path。
+    跨平台: 修改时间用 os.utime，Windows 创建时间用 ctypes SetFileTime。
+    """
+    try:
+        stat_info = os.stat(src_path)
+        # 修改时间 (所有平台)
+        os.utime(dst_path, (stat_info.st_atime, stat_info.st_mtime))
+
+        # 创建时间 (仅 Windows)
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                # 转换时间戳到 FILETIME (1601-01-01 以来的 100ns 间隔)
+                epoch_as_filetime = 116444736000000000  # 1970-01-01 in FILETIME
+                hundred_ns = 10000000  # 每秒 10000000 个 100ns 间隔
+
+                def time_to_filetime(t):
+                    return int(t * hundred_ns + epoch_as_filetime)
+
+                handle = ctypes.windll.kernel32.CreateFileW(
+                    dst_path,
+                    0x40000000,  # GENERIC_WRITE
+                    0x3,         # FILE_SHARE_READ | FILE_SHARE_WRITE
+                    None,
+                    3,           # OPEN_EXISTING
+                    0,           # FILE_ATTRIBUTE_NORMAL
+                    None,
+                )
+                if handle != -1 and handle is not None:
+                    ctime = ctypes.c_longlong(time_to_filetime(stat_info.st_ctime))
+                    atime = ctypes.c_longlong(time_to_filetime(stat_info.st_atime))
+                    mtime = ctypes.c_longlong(time_to_filetime(stat_info.st_mtime))
+                    ctypes.windll.kernel32.SetFileTime(
+                        handle,
+                        ctypes.byref(ctime),
+                        ctypes.byref(atime),
+                        ctypes.byref(mtime),
+                    )
+                    ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass  # 创建时间设置失败不阻塞流程
+    except Exception:
+        pass  # 时间戳设置失败不阻塞流程
+
+
+# ============================================================
 #  图片转换核心
 # ============================================================
 
@@ -279,6 +333,9 @@ def convert_image(
         result["output_size"] = os.path.getsize(output_path)
     except OSError:
         pass
+
+    # ---- 保留原始文件时间戳 ----
+    preserve_timestamps(input_path, output_path)
 
     result["success"] = True
     return result
@@ -465,15 +522,9 @@ def parse_args(argv=None):
         help="跳过已存在的目标文件(不覆盖)",
     )
     parser.add_argument(
-        "--keep-original",
+        "--flat",
         action="store_true",
-        default=True,
-        help="保留原始文件 (默认: 开启)",
-    )
-    parser.add_argument(
-        "--preserve-structure",
-        action="store_true",
-        help="在输出目录中保留输入目录的目录结构",
+        help="不保留目录结构，所有文件直接输出到同一目录",
     )
     parser.add_argument(
         "--bg-color",
@@ -546,13 +597,16 @@ def main():
     total_output_size = 0
 
     for idx, file_path in enumerate(files, 1):
-        # 确定输出路径
-        if args.preserve_structure and not input_is_file:
+        # 确定输出路径 (默认保留目录结构)
+        if not args.flat and not input_is_file:
             out_path = get_output_path_preserve_structure(
                 file_path, input_path, output_dir
             )
         else:
             out_path = get_output_path(file_path, output_dir)
+
+        # 输出路径与输入路径不同时，需要复制跳过/未处理的文件
+        output_differs = os.path.abspath(out_path) != os.path.abspath(file_path)
 
         # 跳过已存在的文件
         if args.skip_existing and os.path.exists(out_path):
@@ -562,7 +616,14 @@ def main():
 
         # 跳过目标格式自身 (如 .webp -> .webp)
         if file_path.lower().endswith(".webp") and not args.lossless:
-            print(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已是 WebP): {file_path}")
+            if output_differs:
+                # 输出路径不同时，复制原文件到输出目录并保留时间戳
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                shutil.copy2(file_path, out_path)
+                preserve_timestamps(file_path, out_path)
+                print(f"  📋  [{idx}/{len(files)}] 复制 (已是 WebP): {file_path}")
+            else:
+                print(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已是 WebP): {file_path}")
             skip_count += 1
             continue
 
