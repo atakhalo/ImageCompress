@@ -81,3 +81,5 @@ crashlytics-build.properties
 /[Aa]ssets/[Ss]treamingAssets/aa/*
 
 *.pyc
+# PyInstaller 生成的配置文件
+*.spec

@@ -1,1 +1,1 @@
-python ImageCompressGUI.py
+pythonw ImageCompressGUI.py
