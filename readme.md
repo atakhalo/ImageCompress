@@ -81,13 +81,4 @@ python ImageCompress.py single.png --output .
 | PNG | `tEXt` 文本块：`parameters` (文本) |
 | WebP/JPEG | EXIF: `UserComment` → parameters 文本 |
 
-## 配合 read_pnginfo.py 使用
-
-```bash
-# 先用压缩脚本转换
-python ImageCompress.py ./images --output ./webp
-
-# 再用读取脚本验证元数据
-python read_pnginfo.py ./webp
-```
 
