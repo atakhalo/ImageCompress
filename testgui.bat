@@ -1,0 +1,1 @@
+python ImageCompressGUI.py

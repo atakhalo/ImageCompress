@@ -606,7 +606,8 @@ def main():
             out_path = get_output_path(file_path, output_dir)
 
         # 输出路径与输入路径不同时，需要复制跳过/未处理的文件
-        output_differs = os.path.abspath(out_path) != os.path.abspath(file_path)
+        # 使用 normcase 确保 Windows 上大小写不敏感比较
+        output_differs = os.path.normcase(os.path.abspath(out_path)) != os.path.normcase(os.path.abspath(file_path))
 
         # 跳过已存在的文件
         if args.skip_existing and os.path.exists(out_path):
