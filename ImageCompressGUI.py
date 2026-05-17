@@ -71,6 +71,7 @@ class ImageCompressGUI:
         self.recursive = tk.BooleanVar(value=True)
         self.skip_existing = tk.BooleanVar(value=False)
         self.flat_mode = tk.BooleanVar(value=False)
+        self.delete_mode = tk.StringVar(value="off")  # off / recycle / permanent
 
         self.is_running = False
         self.cancel_requested = False
@@ -160,6 +161,17 @@ class ImageCompressGUI:
         ttk.Checkbutton(opt_row2, text="不保留目录结构 (所有文件输出到同一目录)",
                         variable=self.flat_mode).pack(side=tk.LEFT)
 
+        # 删除选项
+        del_frame = ttk.Frame(opt_frame)
+        del_frame.pack(fill=tk.X, pady=4)
+        ttk.Label(del_frame, text="转换后删除原文件:").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(del_frame, text="不删除", variable=self.delete_mode,
+                        value="off").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Radiobutton(del_frame, text="移至回收站", variable=self.delete_mode,
+                        value="recycle").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Radiobutton(del_frame, text="永久删除", variable=self.delete_mode,
+                        value="permanent").pack(side=tk.LEFT)
+
         # ======== 操作按钮 ========
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 8))
@@ -195,6 +207,7 @@ class ImageCompressGUI:
         self.log.text.tag_configure("header", foreground="#569cd6", font=("Consolas", 10, "bold"))
         self.log.text.tag_configure("comfyui", foreground="#c586c0")
         self.log.text.tag_configure("webui", foreground="#ce9178")
+        self.log.text.tag_configure("delete", foreground="#ff6b6b")
 
         # ======== 状态栏 ========
         self.status_var = tk.StringVar(value="就绪")
@@ -338,6 +351,7 @@ class ImageCompressGUI:
             method_val = self.method.get()
             skip_existing = self.skip_existing.get()
             flat = self.flat_mode.get()
+            delete_mode = self.delete_mode.get()
 
             # 转换参数
             bg_color = (255, 255, 255)
@@ -349,12 +363,16 @@ class ImageCompressGUI:
                 self._append_log("🎯 模式: 无损压缩", "info")
             else:
                 self._append_log(f"🎯 模式: 有损压缩, quality={quality}", "info")
-            self._append_log(f"🛠  method={method_val}", "info")
+            self._append_log(f"🛠  method={method_val}", "info")            
+            if delete_mode != "off":
+                action = "移至回收站" if delete_mode == "recycle" else "永久删除"
+                self._append_log(f"  🗑️  删除原文件: {action}", "info")            
             self._append_log("")
 
             success_count = 0
             skip_count = 0
             error_count = 0
+            delete_count = 0
             total_input_size = 0
             total_output_size = 0
 
@@ -394,6 +412,15 @@ class ImageCompressGUI:
                         shutil.copy2(file_path, out_path)
                         preserve_timestamps(file_path, out_path)
                         self._append_log(f"  📋  [{idx}/{len(files)}] 复制: {rel}", "copy")
+                        # 复制后删除原文件
+                        if delete_mode != "off":
+                            from ImageCompress import delete_original
+                            if delete_original(file_path, delete_mode):
+                                delete_count += 1
+                                action = "移至回收站" if delete_mode == "recycle" else "永久删除"
+                                self._append_log(f"    🗑️  原文件已{action}", "delete")
+                            else:
+                                self._append_log(f"    ⚠️  原文件删除失败", "skip")
                     else:
                         self._append_log(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已是 WebP): {rel}", "skip")
                     skip_count += 1
@@ -435,6 +462,17 @@ class ImageCompressGUI:
                     total_input_size += result.get("input_size", 0)
                     total_output_size += result.get("output_size", 0)
 
+                    # ---- 删除原文件 ----
+                    if delete_mode != "off":
+                        # 延迟导入
+                        from ImageCompress import delete_original
+                        if delete_original(file_path, delete_mode):
+                            delete_count += 1
+                            action = "移至回收站" if delete_mode == "recycle" else "永久删除"
+                            self._append_log(f"    🗑️  原文件已{action}", "delete")
+                        else:
+                            self._append_log(f"    ⚠️  原文件删除失败", "skip")
+
                     if result.get("warning"):
                         self._append_log(f"    ⚠️  {result['warning']}", "skip")
                 else:
@@ -446,6 +484,8 @@ class ImageCompressGUI:
             self._append_log("─" * 40, "header")
             self._append_log(f"  ✅ 成功: {success_count}", "success")
             self._append_log(f"  ⏭️  跳过: {skip_count}", "skip")
+            if delete_count:
+                self._append_log(f"  🗑️  已删除: {delete_count}", "delete")
             self._append_log(f"  ❌ 失败: {error_count}", "error" if error_count else "info")
 
             if success_count and total_input_size > 0:

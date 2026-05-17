@@ -260,6 +260,51 @@ def preserve_timestamps(src_path: str, dst_path: str):
 
 
 # ============================================================
+#  删除原文件
+# ============================================================
+
+def delete_original(file_path: str, mode: str):
+    """
+    根据 mode 删除原文件。
+    mode: 'off' 不删除, 'recycle' 移至回收站, 'permanent' 永久删除。
+    返回 True 表示成功删除/移动, False 表示跳过或失败。
+    """
+    if mode == "off":
+        return False
+
+    if not os.path.isfile(file_path):
+        return False
+
+    try:
+        if mode == "recycle":
+            if sys.platform == "win32":
+                # 使用 PowerShell 调用 Microsoft.VisualBasic 移动到回收站
+                import subprocess
+                ps_code = (
+                    'Add-Type -AssemblyName Microsoft.VisualBasic; '
+                    f'[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("{file_path}", '
+                    '"OnlyErrorDialogs", "SendToRecycleBin")'
+                )
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_code],
+                    capture_output=True, timeout=30,
+                    startupinfo=startupinfo,
+                )
+                return result.returncode == 0 and not os.path.isfile(file_path)
+            else:
+                # 非 Windows 平台回退到永久删除
+                os.remove(file_path)
+                return not os.path.isfile(file_path)
+        else:  # permanent
+            os.remove(file_path)
+            return not os.path.isfile(file_path)
+    except Exception:
+        return False
+
+
+# ============================================================
 #  图片转换核心
 # ============================================================
 
@@ -479,6 +524,8 @@ def parse_args(argv=None):
   %(prog)s ./images --lossless --method 6
   %(prog)s single.png --output .
   %(prog)s ./images --skip-existing --no-recursive
+  %(prog)s ./images --output ./webp --delete recycle
+  %(prog)s ./images --output ./webp --delete permanent
         """,
     )
 
@@ -525,6 +572,13 @@ def parse_args(argv=None):
         "--flat",
         action="store_true",
         help="不保留目录结构，所有文件直接输出到同一目录",
+    )
+    parser.add_argument(
+        "--delete",
+        type=str,
+        choices=["off", "recycle", "permanent"],
+        default="off",
+        help="转换后删除原文件: off=不删除, recycle=移至回收站, permanent=永久删除 (默认: off)",
     )
     parser.add_argument(
         "--bg-color",
@@ -580,6 +634,9 @@ def main():
     else:
         print(f"  🎯 模式: 有损压缩, quality={args.quality}")
     print(f"  🛠  method={args.method}")
+    if args.delete != "off":
+        action = "移至回收站" if args.delete == "recycle" else "永久删除"
+        print(f"  🗑️  删除原文件: {action}")
     print(f"{'=' * 60}")
 
     if args.dry_run:
@@ -593,6 +650,7 @@ def main():
     success_count = 0
     skip_count = 0
     error_count = 0
+    delete_count = 0
     total_input_size = 0
     total_output_size = 0
 
@@ -623,6 +681,13 @@ def main():
                 shutil.copy2(file_path, out_path)
                 preserve_timestamps(file_path, out_path)
                 print(f"  📋  [{idx}/{len(files)}] 复制 (已是 WebP): {file_path}")
+                # 复制后删除原文件
+                if args.delete != "off":
+                    if delete_original(file_path, args.delete):
+                        delete_count += 1
+                        print(f"    🗑️  原文件已{'移至回收站' if args.delete == 'recycle' else '永久删除'}")
+                    else:
+                        print(f"    ⚠️  原文件删除失败")
             else:
                 print(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已是 WebP): {file_path}")
             skip_count += 1
@@ -657,6 +722,14 @@ def main():
             total_input_size += result.get("input_size", 0)
             total_output_size += result.get("output_size", 0)
 
+            # ---- 删除原文件 ----
+            if args.delete != "off":
+                if delete_original(file_path, args.delete):
+                    delete_count += 1
+                    print(f"    🗑️  原文件已{'移至回收站' if args.delete == 'recycle' else '永久删除'}")
+                else:
+                    print(f"    ⚠️  原文件删除失败")
+
             if result.get("warning"):
                 print(f"    ⚠️  {result['warning']}")
         else:
@@ -669,6 +742,8 @@ def main():
     print(f"     ✅ 成功: {success_count}")
     print(f"     ⏭️  跳过: {skip_count}")
     print(f"     ❌ 失败: {error_count}")
+    if delete_count:
+        print(f"     🗑️  已删除: {delete_count}")
     if success_count and total_input_size > 0:
         saved = total_input_size - total_output_size
         saved_pct = (1 - total_output_size / total_input_size) * 100

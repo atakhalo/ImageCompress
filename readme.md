@@ -72,6 +72,12 @@ python ImageCompress.py single.png --output .
 
 # 转换时自动复制已存在的 WebP 文件到输出目录
 python ImageCompress.py ./images --output ./webp_output
+
+# 转换后删除原文件（移至回收站）
+python ImageCompress.py ./images --output ./webp --delete recycle
+
+# 转换后永久删除原文件
+python ImageCompress.py ./images --output ./webp --delete permanent
 ```
 
 ## 参数说明
@@ -86,6 +92,7 @@ python ImageCompress.py ./images --output ./webp_output
 | `--no-recursive` | 不递归扫描子目录 |
 | `--skip-existing` | 跳过已存在的目标文件 |
 | `--flat` | 不保留目录结构，所有文件输出到同一目录 |
+| `--delete` | 删除原文件: `off`=不删除, `recycle`=移至回收站, `permanent`=永久删除（默认: off） |
 | `--bg-color` | RGBA 转 RGB 时的背景色，格式 R,G,B（默认：255,255,255） |
 | `--dry-run` | 仅扫描预览，不执行转换 |
 
