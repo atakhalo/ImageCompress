@@ -17,6 +17,7 @@ from ImageCompress import (
     get_output_path,
     get_output_path_preserve_structure,
     preserve_timestamps,
+    format_size,
     SUPPORTED_INPUT_EXTENSIONS,
 )
 
@@ -72,6 +73,9 @@ class ImageCompressGUI:
         self.skip_existing = tk.BooleanVar(value=False)
         self.flat_mode = tk.BooleanVar(value=False)
         self.delete_mode = tk.StringVar(value="off")  # off / recycle / permanent
+
+        self.ignore_paths = []  # list of str
+        self.ignore_mode = tk.StringVar(value="skip")  # skip / copy
 
         self.is_running = False
         self.cancel_requested = False
@@ -172,6 +176,41 @@ class ImageCompressGUI:
         ttk.Radiobutton(del_frame, text="永久删除", variable=self.delete_mode,
                         value="permanent").pack(side=tk.LEFT)
 
+        # ======== 忽略路径 ========
+        ignore_frame = ttk.LabelFrame(main_frame, text="忽略路径", padding="8")
+        ignore_frame.pack(fill=tk.X, pady=(0, 8))
+
+        # 忽略模式
+        ignore_mode_frame = ttk.Frame(ignore_frame)
+        ignore_mode_frame.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(ignore_mode_frame, text="忽略模式:").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(ignore_mode_frame, text="直接跳过", variable=self.ignore_mode,
+                        value="skip").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Radiobutton(ignore_mode_frame, text="跳过并复制到输出目录", variable=self.ignore_mode,
+                        value="copy").pack(side=tk.LEFT)
+
+        # 忽略路径列表
+        list_frame = ttk.Frame(ignore_frame)
+        list_frame.pack(fill=tk.X)
+
+        self.ignore_listbox = tk.Listbox(list_frame, height=3, selectmode=tk.SINGLE,
+                                          font=("Consolas", 9))
+        self.ignore_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        # 滚动条
+        ignore_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
+                                       command=self.ignore_listbox.yview)
+        ignore_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.ignore_listbox.configure(yscrollcommand=ignore_scroll.set)
+
+        # 按钮
+        ignore_btn_frame = ttk.Frame(list_frame)
+        ignore_btn_frame.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(ignore_btn_frame, text="添加", width=8,
+                   command=self._add_ignore_path).pack(pady=(0, 2))
+        ttk.Button(ignore_btn_frame, text="移除", width=8,
+                   command=self._remove_ignore_path).pack()
+
         # ======== 操作按钮 ========
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 8))
@@ -240,6 +279,27 @@ class ImageCompressGUI:
         if path:
             self.source_path.set(path)
 
+    def _is_matched_ignore(self, file_path: str, ignore_patterns: list) -> bool:
+        """检查 file_path 是否匹配任意忽略模式"""
+        if not ignore_patterns:
+            return False
+        normalized_path = os.path.normcase(os.path.abspath(file_path))
+        for pattern in ignore_patterns:
+            if not pattern:
+                continue
+            # 统一路径分隔符: 将 / 替换为系统分隔符，再统一大小写
+            norm_pattern = os.path.normcase(pattern.replace("/", os.sep))
+            if os.path.isabs(norm_pattern):
+                if normalized_path == norm_pattern or normalized_path.startswith(norm_pattern + os.sep):
+                    return True
+                # 绝对路径也尝试子串匹配 (处理不同驱动器等场景)
+                if norm_pattern in normalized_path:
+                    return True
+            else:
+                if norm_pattern in normalized_path:
+                    return True
+        return False
+
     def _browse_source_file(self):
         path = filedialog.askopenfilename(
             title="选择源文件",
@@ -248,6 +308,30 @@ class ImageCompressGUI:
         )
         if path:
             self.source_path.set(path)
+
+    def _add_ignore_path(self):
+        """添加忽略路径"""
+        path = filedialog.askdirectory(title="选择要忽略的目录") or \
+               filedialog.askopenfilename(title="选择要忽略的文件")
+        if path:
+            if path not in self.ignore_paths:
+                self.ignore_paths.append(path)
+                self._refresh_ignore_list()
+
+    def _remove_ignore_path(self):
+        """移除选中的忽略路径"""
+        sel = self.ignore_listbox.curselection()
+        if sel:
+            idx = sel[0]
+            if 0 <= idx < len(self.ignore_paths):
+                self.ignore_paths.pop(idx)
+                self._refresh_ignore_list()
+
+    def _refresh_ignore_list(self):
+        """刷新忽略路径列表显示"""
+        self.ignore_listbox.delete(0, tk.END)
+        for p in self.ignore_paths:
+            self.ignore_listbox.insert(tk.END, p)
 
     def _browse_output_dir(self):
         path = filedialog.askdirectory(title="选择输出目录")
@@ -336,6 +420,14 @@ class ImageCompressGUI:
         self.status_var.set("正在取消...")
 
     def _run_convert(self, source):
+        # 在 try 外部初始化计数器，确保异常时也能访问
+        success_count = 0
+        skip_count = 0
+        error_count = 0
+        delete_count = 0
+        total_input_size = 0
+        total_output_size = 0
+
         try:
             files = self._get_files(source)
             if not files:
@@ -352,6 +444,8 @@ class ImageCompressGUI:
             skip_existing = self.skip_existing.get()
             flat = self.flat_mode.get()
             delete_mode = self.delete_mode.get()
+            ignore_paths = list(self.ignore_paths)
+            ignore_mode = self.ignore_mode.get()
 
             # 转换参数
             bg_color = (255, 255, 255)
@@ -367,15 +461,11 @@ class ImageCompressGUI:
             if delete_mode != "off":
                 action = "移至回收站" if delete_mode == "recycle" else "永久删除"
                 self._append_log(f"  🗑️  删除原文件: {action}", "info")            
-            self._append_log("")
-
-            success_count = 0
-            skip_count = 0
-            error_count = 0
-            delete_count = 0
-            total_input_size = 0
-            total_output_size = 0
-
+            if ignore_paths:
+                mode_label = "直接跳过" if ignore_mode == "skip" else "跳过并复制"
+                self._append_log(f"  🚫  忽略路径 ({mode_label}):", "info")
+                for p in ignore_paths:
+                    self._append_log(f"       · {p}", "info")
             for idx, file_path in enumerate(files, 1):
                 if self.cancel_requested:
                     self._append_log("\n⏹ 已取消", "skip")
@@ -396,6 +486,21 @@ class ImageCompressGUI:
                 # 检查取消
                 if self.cancel_requested:
                     break
+
+                # 检查忽略路径
+                if ignore_paths and self._is_matched_ignore(file_path, ignore_paths):
+                    rel = os.path.relpath(file_path, source) if os.path.isdir(source) else os.path.basename(file_path)
+                    if ignore_mode == "skip":
+                        self._append_log(f"  🚫  [{idx}/{len(files)}] 忽略 (匹配忽略路径): {rel}", "skip")
+                        skip_count += 1
+                        continue
+                    else:  # copy
+                        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                        shutil.copy2(file_path, out_path)
+                        preserve_timestamps(file_path, out_path)
+                        self._append_log(f"  📋  [{idx}/{len(files)}] 忽略并复制: {rel}", "copy")
+                        skip_count += 1
+                        continue
 
                 # 跳过已存在的文件
                 if skip_existing and os.path.exists(out_path):
@@ -491,9 +596,9 @@ class ImageCompressGUI:
             if success_count and total_input_size > 0:
                 saved = total_input_size - total_output_size
                 saved_pct = (1 - total_output_size / total_input_size) * 100
-                self._append_log(f"  💾 原始大小: {total_input_size / 1024:.1f} KB", "info")
-                self._append_log(f"  💾 输出大小: {total_output_size / 1024:.1f} KB", "info")
-                self._append_log(f"  📉 节省空间: {saved / 1024:.1f} KB ({saved_pct:.1f}%)", "success")
+                self._append_log(f"  💾 原始大小: {format_size(total_input_size)}", "info")
+                self._append_log(f"  💾 输出大小: {format_size(total_output_size)}", "info")
+                self._append_log(f"  📉 节省空间: {format_size(saved)} ({saved_pct:.1f}%)", "success")
 
             self._append_log("─" * 40, "header")
 

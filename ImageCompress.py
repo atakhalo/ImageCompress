@@ -8,6 +8,7 @@
   - 支持有损/无损压缩
   - 支持自定义输出目录，不覆盖原文件
   - 支持排除已转换文件 (跳过)
+  - 支持忽略路径 (可多个，可选直接跳过或复制到输出目录)
 
 用法:
   python ImageCompress.py [输入目录/文件] [选项]
@@ -204,6 +205,26 @@ def build_exif_from_metadata(metadata: dict) -> dict:
             del exif_dict[ifd]
 
     return exif_dict
+
+
+# ============================================================
+#  文件大小格式化
+# ============================================================
+
+def format_size(size_bytes: int) -> str:
+    """
+    将字节数自动转为合适的单位 (B, KB, MB, GB, TB)。
+    最多保留 2 位小数，单位间按 1024 换算。
+    """
+    if size_bytes < 1024:
+        return f"{size_bytes:.1f} B"
+    units = ["KB", "MB", "GB", "TB"]
+    value = size_bytes / 1024.0
+    for unit in units:
+        if value < 1024.0:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} PB"
 
 
 # ============================================================
@@ -463,9 +484,43 @@ def scan_images(input_path: str, recursive: bool = True) -> list:
         files.extend(glob.glob(pattern, recursive=recursive))
         files.extend(glob.glob(pattern_upper, recursive=recursive))
 
-    # 去重并排序
-    files = sorted(set(f.lower() for f in files))
+    # 去重并排序 (保留原文件名大小写)
+    # Windows 文件系统大小写不敏感，因此不同大小写的同名文件不会同时出现
+    files = sorted(set(f for f in files))
     return files
+
+
+# ============================================================
+#  忽略路径匹配
+# ============================================================
+
+def is_matched_ignore(file_path: str, ignore_patterns: list) -> bool:
+    """
+    检查 file_path 是否匹配任意忽略模式。
+    匹配规则: 路径中任意部分包含模式字符串 (大小写不敏感)。
+    路径分隔符在比较前统一为系统默认分隔符。
+    """
+    if not ignore_patterns:
+        return False
+    normalized_path = os.path.normcase(os.path.abspath(file_path))
+    for pattern in ignore_patterns:
+        if not pattern:
+            continue
+        # 统一路径分隔符: 将 / 替换为系统分隔符，再统一大小写
+        norm_pattern = os.path.normcase(pattern.replace("/", os.sep))
+        # 如果模式是绝对路径，精确匹配或前缀匹配
+        if os.path.isabs(norm_pattern):
+            if normalized_path == norm_pattern or normalized_path.startswith(norm_pattern + os.sep):
+                return True
+            # 即使绝对路径未匹配，也尝试子串匹配
+            # (适用于忽略路径与文件在不同驱动器等场景)
+            if norm_pattern in normalized_path:
+                return True
+        else:
+            # 在路径中搜索模式字符串
+            if norm_pattern in normalized_path:
+                return True
+    return False
 
 
 # ============================================================
@@ -526,6 +581,8 @@ def parse_args(argv=None):
   %(prog)s ./images --skip-existing --no-recursive
   %(prog)s ./images --output ./webp --delete recycle
   %(prog)s ./images --output ./webp --delete permanent
+  %(prog)s ./images --ignore ./screenshots --ignore ./backup
+  %(prog)s ./images --output ./webp --ignore ./screenshots --ignore-mode copy
         """,
     )
 
@@ -562,6 +619,19 @@ def parse_args(argv=None):
         "--no-recursive",
         action="store_true",
         help="不递归扫描子目录",
+    )
+    parser.add_argument(
+        "--ignore",
+        action="append",
+        default=[],
+        help="忽略的路径 (可多次使用)，匹配路径包含此字符串的文件将被忽略",
+    )
+    parser.add_argument(
+        "--ignore-mode",
+        type=str,
+        choices=["skip", "copy"],
+        default="skip",
+        help="忽略文件的处理方式: skip=直接跳过, copy=跳过但复制到输出目录 (默认: skip)",
     )
     parser.add_argument(
         "--skip-existing",
@@ -637,6 +707,11 @@ def main():
     if args.delete != "off":
         action = "移至回收站" if args.delete == "recycle" else "永久删除"
         print(f"  🗑️  删除原文件: {action}")
+    if args.ignore:
+        mode_label = "直接跳过" if args.ignore_mode == "skip" else "跳过并复制"
+        print(f"  🚫  忽略路径 ({mode_label}):")
+        for p in args.ignore:
+            print(f"       · {p}")
     print(f"{'=' * 60}")
 
     if args.dry_run:
@@ -672,6 +747,20 @@ def main():
             print(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已存在): {file_path}")
             skip_count += 1
             continue
+
+        # 检查忽略路径
+        if args.ignore and is_matched_ignore(file_path, args.ignore):
+            if args.ignore_mode == "skip":
+                print(f"  🚫  [{idx}/{len(files)}] 忽略 (匹配忽略路径): {file_path}")
+                skip_count += 1
+                continue
+            else:  # copy
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                shutil.copy2(file_path, out_path)
+                preserve_timestamps(file_path, out_path)
+                print(f"  📋  [{idx}/{len(files)}] 忽略并复制: {file_path}")
+                skip_count += 1
+                continue
 
         # 跳过目标格式自身 (如 .webp -> .webp)
         if file_path.lower().endswith(".webp") and not args.lossless:
@@ -747,9 +836,9 @@ def main():
     if success_count and total_input_size > 0:
         saved = total_input_size - total_output_size
         saved_pct = (1 - total_output_size / total_input_size) * 100
-        print(f"     💾 原始大小: {total_input_size / 1024:.1f} KB")
-        print(f"     💾 输出大小: {total_output_size / 1024:.1f} KB")
-        print(f"     📉 节省空间: {saved / 1024:.1f} KB ({saved_pct:.1f}%)")
+        print(f"     💾 原始大小: {format_size(total_input_size)}")
+        print(f"     💾 输出大小: {format_size(total_output_size)}")
+        print(f"     📉 节省空间: {format_size(saved)} ({saved_pct:.1f}%)")
     print(f"{'=' * 60}\n")
 
 

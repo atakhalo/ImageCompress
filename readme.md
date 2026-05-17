@@ -36,6 +36,7 @@ python ImageCompressGUI.py
 - 无损/有损切换
 - 压缩方法选择
 - 递归扫描、跳过已存在文件等选项
+- 忽略路径设置（可添加多个，支持直接跳过或复制到输出目录）
 - 预览模式
 - 实时日志输出
 - 取消操作支持
@@ -78,6 +79,12 @@ python ImageCompress.py ./images --output ./webp --delete recycle
 
 # 转换后永久删除原文件
 python ImageCompress.py ./images --output ./webp --delete permanent
+
+# 忽略指定路径（直接跳过）
+python ImageCompress.py ./images --ignore ./images/screenshots --ignore ./images/backup
+
+# 忽略指定路径（跳过但复制到输出目录）
+python ImageCompress.py ./images --output ./webp --ignore ./images/screenshots --ignore-mode copy
 ```
 
 ## 参数说明
@@ -92,6 +99,8 @@ python ImageCompress.py ./images --output ./webp --delete permanent
 | `--no-recursive` | 不递归扫描子目录 |
 | `--skip-existing` | 跳过已存在的目标文件 |
 | `--flat` | 不保留目录结构，所有文件输出到同一目录 |
+| `--ignore` | 忽略路径（可多次使用），匹配路径包含此字符串的文件将跳过处理 |
+| `--ignore-mode` | 忽略文件的处理方式: `skip`=直接跳过, `copy`=跳过但复制到输出目录（默认: skip） |
 | `--delete` | 删除原文件: `off`=不删除, `recycle`=移至回收站, `permanent`=永久删除（默认: off） |
 | `--bg-color` | RGBA 转 RGB 时的背景色，格式 R,G,B（默认：255,255,255） |
 | `--dry-run` | 仅扫描预览，不执行转换 |
