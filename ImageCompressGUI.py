@@ -7,6 +7,8 @@ import os
 import sys
 import shutil
 import threading
+import time
+import concurrent.futures
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -17,7 +19,10 @@ from ImageCompress import (
     get_output_path,
     get_output_path_preserve_structure,
     preserve_timestamps,
+    delete_original,
     format_size,
+    ALL_FORMAT_NAMES,
+    FORMAT_EXTENSIONS,
     SUPPORTED_INPUT_EXTENSIONS,
 )
 
@@ -76,6 +81,13 @@ class ImageCompressGUI:
 
         self.ignore_paths = []  # list of str
         self.ignore_mode = tk.StringVar(value="skip")  # skip / copy
+        cpu_count = os.cpu_count() or 4
+        self.workers = tk.IntVar(value=cpu_count)  # 并行线程数
+
+        # 格式选择: 默认全选
+        self.format_vars = {}
+        for name in ALL_FORMAT_NAMES:
+            self.format_vars[name] = tk.BooleanVar(value=True)
 
         self.is_running = False
         self.cancel_requested = False
@@ -175,6 +187,26 @@ class ImageCompressGUI:
                         value="recycle").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Radiobutton(del_frame, text="永久删除", variable=self.delete_mode,
                         value="permanent").pack(side=tk.LEFT)
+
+        # 并行线程数
+        cpu_count = os.cpu_count() or 4
+        worker_frame = ttk.Frame(opt_frame)
+        worker_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(worker_frame, text="并行线程:").pack(side=tk.LEFT, padx=(0, 8))
+        workers_spin = ttk.Spinbox(worker_frame, from_=1, to=cpu_count,
+                                    textvariable=self.workers, width=5)
+        workers_spin.pack(side=tk.LEFT)
+        ttk.Label(worker_frame, text=f"(1~{cpu_count}, 默认{cpu_count})", foreground="gray").pack(side=tk.LEFT, padx=4)
+
+        # ======== 格式选择 ========
+        fmt_frame = ttk.LabelFrame(main_frame, text="处理格式（不勾选的不会扫描到）", padding="8")
+        fmt_frame.pack(fill=tk.X, pady=(0, 8))
+        fmt_inner = ttk.Frame(fmt_frame)
+        fmt_inner.pack(fill=tk.X)
+        for name in ALL_FORMAT_NAMES:
+            cb = ttk.Checkbutton(fmt_inner, text=name.upper(),
+                                  variable=self.format_vars[name])
+            cb.pack(side=tk.LEFT, padx=(0, 12))
 
         # ======== 忽略路径 ========
         ignore_frame = ttk.LabelFrame(main_frame, text="忽略路径", padding="8")
@@ -378,7 +410,12 @@ class ImageCompressGUI:
             if ext in SUPPORTED_INPUT_EXTENSIONS:
                 return [source]
             return []
-        return scan_images(source, recursive=self.recursive.get())
+        # 获取选中的格式
+        format_filter = set()
+        for name, var in self.format_vars.items():
+            if var.get():
+                format_filter.add(name)
+        return scan_images(source, recursive=self.recursive.get(), format_filter=format_filter)
 
     def _get_output_dir(self, source):
         out = self.output_path.get().strip()
@@ -447,6 +484,18 @@ class ImageCompressGUI:
             ignore_paths = list(self.ignore_paths)
             ignore_mode = self.ignore_mode.get()
 
+            # ---- 忽略路径过滤 (skip 模式：扫描阶段直接移除) ----
+            if ignore_paths and ignore_mode == "skip":
+                before = len(files)
+                files = [f for f in files if not self._is_matched_ignore(f, ignore_paths)]
+                filtered = before - len(files)
+                if filtered:
+                    self._append_log(f"  🚫 忽略路径过滤: 移除了 {filtered} 个文件", "info")
+                if not files:
+                    self._append_log("📭 所有文件均被忽略路径排除", "error")
+                    self._finish()
+                    return
+
             # 转换参数
             bg_color = (255, 255, 255)
 
@@ -461,14 +510,22 @@ class ImageCompressGUI:
             if delete_mode != "off":
                 action = "移至回收站" if delete_mode == "recycle" else "永久删除"
                 self._append_log(f"  🗑️  删除原文件: {action}", "info")            
-            if ignore_paths:
-                mode_label = "直接跳过" if ignore_mode == "skip" else "跳过并复制"
-                self._append_log(f"  🚫  忽略路径 ({mode_label}):", "info")
+            if ignore_paths and ignore_mode == "copy":
+                self._append_log(f"  🚫  忽略路径 (跳过并复制):", "info")
                 for p in ignore_paths:
                     self._append_log(f"       · {p}", "info")
+            workers = self.workers.get()
+            self._append_log(f"  🧵 并行线程: {workers}" if workers > 1 else f"  🧵 单线程处理", "info")
+
+            # ---- 计时开始 ----
+            _start_time = time.time()
+
+            # ---- 构建任务列表（串行，过滤跳过/忽略/复制）----
+            tasks = []
+            total_files = len(files)
+
             for idx, file_path in enumerate(files, 1):
                 if self.cancel_requested:
-                    self._append_log("\n⏹ 已取消", "skip")
                     break
 
                 # 确定输出路径
@@ -479,114 +536,127 @@ class ImageCompressGUI:
                 else:
                     out_path = get_output_path(file_path, output_dir)
 
-                # 输出路径与输入路径不同时，需要复制跳过/未处理的文件
-                # 使用 normcase 确保 Windows 上大小写不敏感比较
                 output_differs = os.path.normcase(os.path.abspath(out_path)) != os.path.normcase(os.path.abspath(file_path))
-
-                # 检查取消
-                if self.cancel_requested:
-                    break
-
-                # 检查忽略路径
-                if ignore_paths and self._is_matched_ignore(file_path, ignore_paths):
-                    rel = os.path.relpath(file_path, source) if os.path.isdir(source) else os.path.basename(file_path)
-                    if ignore_mode == "skip":
-                        self._append_log(f"  🚫  [{idx}/{len(files)}] 忽略 (匹配忽略路径): {rel}", "skip")
-                        skip_count += 1
-                        continue
-                    else:  # copy
-                        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                        shutil.copy2(file_path, out_path)
-                        preserve_timestamps(file_path, out_path)
-                        self._append_log(f"  📋  [{idx}/{len(files)}] 忽略并复制: {rel}", "copy")
-                        skip_count += 1
-                        continue
+                rel = os.path.relpath(file_path, source) if os.path.isdir(source) else os.path.basename(file_path)
 
                 # 跳过已存在的文件
                 if skip_existing and os.path.exists(out_path):
-                    rel = os.path.relpath(file_path, source) if os.path.isdir(source) else os.path.basename(file_path)
-                    self._append_log(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已存在): {rel}", "skip")
+                    self._append_log(f"  ⏭️  [{idx}/{total_files}] 跳过 (已存在): {rel}", "skip")
                     skip_count += 1
                     continue
 
-                # 跳过目标格式自身 (如 .webp -> .webp)
+                # 忽略路径 (copy 模式：跳过但复制)
+                if ignore_paths and ignore_mode == "copy" and self._is_matched_ignore(file_path, ignore_paths):
+                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                    shutil.copy2(file_path, out_path)
+                    preserve_timestamps(file_path, out_path)
+                    self._append_log(f"  📋  [{idx}/{total_files}] 忽略并复制: {rel}", "copy")
+                    skip_count += 1
+                    continue
+
+                # 跳过目标格式自身
                 if file_path.lower().endswith(".webp") and not lossless:
-                    rel = os.path.relpath(file_path, source) if os.path.isdir(source) else os.path.basename(file_path)
                     if output_differs:
                         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
                         shutil.copy2(file_path, out_path)
                         preserve_timestamps(file_path, out_path)
-                        self._append_log(f"  📋  [{idx}/{len(files)}] 复制: {rel}", "copy")
-                        # 复制后删除原文件
-                        if delete_mode != "off":
-                            from ImageCompress import delete_original
-                            if delete_original(file_path, delete_mode):
-                                delete_count += 1
-                                action = "移至回收站" if delete_mode == "recycle" else "永久删除"
-                                self._append_log(f"    🗑️  原文件已{action}", "delete")
-                            else:
-                                self._append_log(f"    ⚠️  原文件删除失败", "skip")
+                        self._append_log(f"  📋  [{idx}/{total_files}] 复制 (已是 WebP): {rel}", "copy")
                     else:
-                        self._append_log(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已是 WebP): {rel}", "skip")
+                        self._append_log(f"  ⏭️  [{idx}/{total_files}] 跳过 (已是 WebP): {rel}", "skip")
                     skip_count += 1
                     continue
 
-                # 更新状态
-                rel = os.path.relpath(file_path, source) if os.path.isdir(source) else os.path.basename(file_path)
-                self._append_log(f"  🔄  [{idx}/{len(files)}] {rel}", "info")
+                # 加入转换任务
+                tasks.append((idx, file_path, out_path, rel))
 
-                # 执行转换
-                result = convert_image(
-                    input_path=file_path,
-                    output_path=out_path,
-                    quality=quality,
-                    lossless=lossless,
-                    method=method_val,
-                    bg_color=bg_color,
-                )
+            # ---- 并行转换 ----
+            if tasks and not self.cancel_requested:
+                total_tasks = len(tasks)
+                self._append_log(f"\n  🚀 开始处理 {total_tasks} 个文件", "info")
 
-                self._update_status(f"处理中: [{idx}/{len(files)}]")
+                # 线程安全计数器
+                _lock = threading.Lock()
+                _success_count = 0
+                _error_count = 0
+                _delete_count = 0
+                _total_input_size = 0
+                _total_output_size = 0
 
-                if result["success"]:
-                    ratio = ""
-                    if result["input_size"] and result["output_size"]:
-                        pct = (1 - result["output_size"] / result["input_size"]) * 100
-                        sign = "-" if pct >= 0 else "+"
-                        ratio = f" ({sign}{abs(pct):.1f}%)"
+                def _process_one(task_item):
+                    nonlocal _success_count, _error_count, _delete_count, _total_input_size, _total_output_size
+                    idx, fpath, opath, rel_path = task_item
 
-                    source_tag = {
-                        "comfyui": " [ComfyUI]",
-                        "webui": " [WebUI]",
-                        "unknown": "",
-                    }.get(result.get("source", ""), "")
+                    if self.cancel_requested:
+                        return
 
-                    tag = "comfyui" if result.get("source") == "comfyui" else ("webui" if result.get("source") == "webui" else "success")
-                    self._append_log(f"  ✅ → {os.path.basename(out_path)}{source_tag}{ratio}", tag)
+                    result = convert_image(
+                        input_path=fpath,
+                        output_path=opath,
+                        quality=quality,
+                        lossless=lossless,
+                        method=method_val,
+                        bg_color=bg_color,
+                    )
 
-                    success_count += 1
-                    total_input_size += result.get("input_size", 0)
-                    total_output_size += result.get("output_size", 0)
+                    with _lock:
+                        if self.cancel_requested:
+                            return
 
-                    # ---- 删除原文件 ----
-                    if delete_mode != "off":
-                        # 延迟导入
-                        from ImageCompress import delete_original
-                        if delete_original(file_path, delete_mode):
-                            delete_count += 1
-                            action = "移至回收站" if delete_mode == "recycle" else "永久删除"
-                            self._append_log(f"    🗑️  原文件已{action}", "delete")
+                        if result["success"]:
+                            ratio_str = ""
+                            if result["input_size"] and result["output_size"]:
+                                pct = (1 - result["output_size"] / result["input_size"]) * 100
+                                sign = "-" if pct >= 0 else "+"
+                                ratio_str = f" ({sign}{abs(pct):.1f}%)"
+
+                            source_tag = {
+                                "comfyui": " [ComfyUI]",
+                                "webui": " [WebUI]",
+                                "unknown": "",
+                            }.get(result.get("source", ""), "")
+
+                            tag = "comfyui" if result.get("source") == "comfyui" else ("webui" if result.get("source") == "webui" else "success")
+                            self._append_log(f"  ✅  [{idx}/{total_files}] {rel_path}{source_tag}{ratio_str}", tag)
+
+                            _success_count += 1
+                            _total_input_size += result.get("input_size", 0)
+                            _total_output_size += result.get("output_size", 0)
+
+                            if result.get("warning"):
+                                self._append_log(f"    ⚠️  {result['warning']}", "skip")
+
+                            # ------ 转换成功，立即删除原文件 ------
+                            if delete_mode != "off":
+                                if delete_original(fpath, delete_mode):
+                                    _delete_count += 1
+                                    action = "移至回收站" if delete_mode == "recycle" else "永久删除"
+                                    self._append_log(f"    🗑️  [{idx}/{total_files}] 原文件已{action}", "delete")
+                                else:
+                                    self._append_log(f"    ⚠️  [{idx}/{total_files}] 原文件删除失败", "skip")
                         else:
-                            self._append_log(f"    ⚠️  原文件删除失败", "skip")
+                            self._append_log(f"  ❌  [{idx}/{total_files}] {rel_path} — {result['error']}", "error")
+                            _error_count += 1
 
-                    if result.get("warning"):
-                        self._append_log(f"    ⚠️  {result['warning']}", "skip")
-                else:
-                    self._append_log(f"  ❌ {result['error']}", "error")
-                    error_count += 1
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    list(executor.map(_process_one, tasks))
+
+                success_count = _success_count
+                error_count = _error_count
+                delete_count = _delete_count
+                total_input_size = _total_input_size
+                total_output_size = _total_output_size
 
             # 输出统计
             self._append_log("")
             self._append_log("─" * 40, "header")
+            elapsed = time.time() - _start_time
+            if elapsed < 60:
+                elapsed_str = f"{elapsed:.1f} 秒"
+            else:
+                minutes = int(elapsed // 60)
+                seconds = elapsed % 60
+                elapsed_str = f"{minutes} 分 {seconds:.0f} 秒"
+            self._append_log(f"  ⏱️  耗时: {elapsed_str}", "info")
             self._append_log(f"  ✅ 成功: {success_count}", "success")
             self._append_log(f"  ⏭️  跳过: {skip_count}", "skip")
             if delete_count:

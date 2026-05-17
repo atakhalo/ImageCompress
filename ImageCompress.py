@@ -26,6 +26,9 @@ import json
 import argparse
 import glob
 import shutil
+import threading
+import time
+import concurrent.futures
 from pathlib import Path
 
 from PIL import Image, PngImagePlugin
@@ -38,6 +41,19 @@ import piexif.helper
 # ============================================================
 
 SUPPORTED_INPUT_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
+
+# 格式显示名称与扩展名的映射 (用于 CLI/GUI 选择)
+FORMAT_EXTENSIONS = {
+    'png': ['.png'],
+    'jpg': ['.jpg', '.jpeg'],
+    'bmp': ['.bmp'],
+    'tiff': ['.tiff', '.tif'],
+    'webp': ['.webp'],
+}
+
+# 所有可选格式名称列表
+ALL_FORMAT_NAMES = sorted(FORMAT_EXTENSIONS.keys())
+
 FORMAT_MAP = {
     '.webp': 'WEBP',
     '.jpg': 'JPEG',
@@ -453,17 +469,30 @@ def prepare_image_for_webp(image: Image.Image, bg_color: tuple = (255, 255, 255)
 #  文件扫描
 # ============================================================
 
-def scan_images(input_path: str, recursive: bool = True) -> list:
+def scan_images(input_path: str, recursive: bool = True, format_filter: set = None) -> list:
     """
     扫描路径下所有支持的图片文件。
     如果 input_path 是文件，直接返回该文件。
     如果 input_path 是目录，递归扫描所有图片文件。
+    format_filter: 要包含的格式集合，如 {'png', 'jpg'}。默认 None 表示全部。
     """
+    # 确定要扫描的扩展名
+    if format_filter:
+        exts_to_scan = set()
+        for fmt in format_filter:
+            fmt = fmt.lower().lstrip('.')
+            if fmt in FORMAT_EXTENSIONS:
+                exts_to_scan.update(FORMAT_EXTENSIONS[fmt])
+        if not exts_to_scan:
+            exts_to_scan = SUPPORTED_INPUT_EXTENSIONS
+    else:
+        exts_to_scan = SUPPORTED_INPUT_EXTENSIONS
+
     path = Path(input_path)
 
     if path.is_file():
         ext = path.suffix.lower()
-        if ext in SUPPORTED_INPUT_EXTENSIONS:
+        if ext in exts_to_scan:
             return [str(path)]
         else:
             print(f"  ⚠️  不支持的格式: {path.name}")
@@ -474,7 +503,7 @@ def scan_images(input_path: str, recursive: bool = True) -> list:
         return []
 
     files = []
-    for ext in SUPPORTED_INPUT_EXTENSIONS:
+    for ext in exts_to_scan:
         if recursive:
             pattern = str(path / "**" / f"*{ext}")
             pattern_upper = str(path / "**" / f"*{ext.upper()}")
@@ -657,6 +686,20 @@ def parse_args(argv=None):
         help="RGBA 转 RGB 时的背景色, 格式 R,G,B (默认: 255,255,255)",
     )
     parser.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=None,
+        help="并行处理线程数 (默认: CPU 核心数，单文件时自动设为 1)",
+    )
+    parser.add_argument(
+        "-f", "--format",
+        action="append",
+        default=[],
+        dest="formats",
+        choices=ALL_FORMAT_NAMES,
+        help=f"要处理的图片格式 (可多次使用，如 -f png -f jpg)。默认: 全部 ({', '.join(ALL_FORMAT_NAMES)})",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="仅扫描和预览，不执行转换",
@@ -689,11 +732,23 @@ def main():
 
     # ---- 扫描文件 ----
     recursive = not args.no_recursive
-    files = scan_images(input_path, recursive=recursive)
+    format_filter = set(args.formats) if args.formats else None
+    files = scan_images(input_path, recursive=recursive, format_filter=format_filter)
 
     if not files:
         print(f"📭 未找到支持的图片文件 (支持格式: {', '.join(sorted(SUPPORTED_INPUT_EXTENSIONS))})")
         return
+
+    # ---- 忽略路径过滤 (skip 模式：扫描阶段直接移除) ----
+    if args.ignore and args.ignore_mode == "skip":
+        before = len(files)
+        files = [f for f in files if not is_matched_ignore(f, args.ignore)]
+        filtered = before - len(files)
+        if filtered:
+            print(f"  🚫 忽略路径过滤: 移除了 {filtered} 个文件")
+        if not files:
+            print(f"📭 所有文件均被忽略路径排除")
+            return
 
     print(f"\n{'=' * 60}")
     print(f"  📁 输入: {os.path.abspath(input_path)}")
@@ -704,14 +759,21 @@ def main():
     else:
         print(f"  🎯 模式: 有损压缩, quality={args.quality}")
     print(f"  🛠  method={args.method}")
+    if format_filter:
+        print(f"  📋 格式: {', '.join(sorted(format_filter))}")
     if args.delete != "off":
         action = "移至回收站" if args.delete == "recycle" else "永久删除"
         print(f"  🗑️  删除原文件: {action}")
-    if args.ignore:
-        mode_label = "直接跳过" if args.ignore_mode == "skip" else "跳过并复制"
-        print(f"  🚫  忽略路径 ({mode_label}):")
+    if args.ignore and args.ignore_mode == "copy":
+        print(f"  🚫  忽略路径 (跳过并复制):")
         for p in args.ignore:
             print(f"       · {p}")
+    # ---- 线程数 ----
+    workers = args.workers
+    if workers is None:
+        # 单文件用 1 线程，否则用 CPU 核心数
+        workers = 1 if len(files) <= 1 else min(os.cpu_count() or 4, len(files))
+    print(f"  🧵 并行线程: {workers}" if workers > 1 else f"  🧵 单线程处理")
     print(f"{'=' * 60}")
 
     if args.dry_run:
@@ -721,16 +783,16 @@ def main():
         print(f"\n  ✅ 共 {len(files)} 个文件待处理")
         return
 
-    # ---- 执行转换 ----
-    success_count = 0
+    # ---- 计时开始 ----
+    _start_time = time.time()
+
+    # ---- 构建任务列表（串行，过滤跳过/忽略/复制）----
+    tasks = []
     skip_count = 0
-    error_count = 0
-    delete_count = 0
-    total_input_size = 0
-    total_output_size = 0
+    total_files = len(files)
 
     for idx, file_path in enumerate(files, 1):
-        # 确定输出路径 (默认保留目录结构)
+        # 确定输出路径
         if not args.flat and not input_is_file:
             out_path = get_output_path_preserve_structure(
                 file_path, input_path, output_dir
@@ -738,99 +800,122 @@ def main():
         else:
             out_path = get_output_path(file_path, output_dir)
 
-        # 输出路径与输入路径不同时，需要复制跳过/未处理的文件
-        # 使用 normcase 确保 Windows 上大小写不敏感比较
         output_differs = os.path.normcase(os.path.abspath(out_path)) != os.path.normcase(os.path.abspath(file_path))
 
         # 跳过已存在的文件
         if args.skip_existing and os.path.exists(out_path):
-            print(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已存在): {file_path}")
+            print(f"  ⏭️  [{idx}/{total_files}] 跳过 (已存在): {file_path}")
             skip_count += 1
             continue
 
-        # 检查忽略路径
-        if args.ignore and is_matched_ignore(file_path, args.ignore):
-            if args.ignore_mode == "skip":
-                print(f"  🚫  [{idx}/{len(files)}] 忽略 (匹配忽略路径): {file_path}")
-                skip_count += 1
-                continue
-            else:  # copy
-                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                shutil.copy2(file_path, out_path)
-                preserve_timestamps(file_path, out_path)
-                print(f"  📋  [{idx}/{len(files)}] 忽略并复制: {file_path}")
-                skip_count += 1
-                continue
+        # 忽略路径 (copy 模式：跳过但复制)
+        if args.ignore and args.ignore_mode == "copy" and is_matched_ignore(file_path, args.ignore):
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            shutil.copy2(file_path, out_path)
+            preserve_timestamps(file_path, out_path)
+            print(f"  📋  [{idx}/{total_files}] 忽略并复制: {file_path}")
+            skip_count += 1
+            continue
 
-        # 跳过目标格式自身 (如 .webp -> .webp)
+        # 跳过目标格式自身
         if file_path.lower().endswith(".webp") and not args.lossless:
             if output_differs:
-                # 输出路径不同时，复制原文件到输出目录并保留时间戳
                 os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
                 shutil.copy2(file_path, out_path)
                 preserve_timestamps(file_path, out_path)
-                print(f"  📋  [{idx}/{len(files)}] 复制 (已是 WebP): {file_path}")
-                # 复制后删除原文件
-                if args.delete != "off":
-                    if delete_original(file_path, args.delete):
-                        delete_count += 1
-                        print(f"    🗑️  原文件已{'移至回收站' if args.delete == 'recycle' else '永久删除'}")
-                    else:
-                        print(f"    ⚠️  原文件删除失败")
+                print(f"  📋  [{idx}/{total_files}] 复制 (已是 WebP): {file_path}")
             else:
-                print(f"  ⏭️  [{idx}/{len(files)}] 跳过 (已是 WebP): {file_path}")
+                print(f"  ⏭️  [{idx}/{total_files}] 跳过 (已是 WebP): {file_path}")
             skip_count += 1
             continue
 
-        print(f"  🔄  [{idx}/{len(files)}] {file_path}", end="")
+        # 加入转换任务
+        tasks.append((idx, file_path, out_path))
 
-        result = convert_image(
-            input_path=file_path,
-            output_path=out_path,
-            quality=args.quality,
-            lossless=args.lossless,
-            method=args.method,
-            bg_color=bg_color,
-        )
+    # ---- 并行转换 ----
+    if not tasks:
+        print("\n  📭 没有需要转换的文件")
+    else:
+        total_tasks = len(tasks)
+        print(f"\n  🚀 开始处理 {total_tasks} 个文件 (线程数: {workers})")
 
-        if result["success"]:
-            ratio = ""
-            if result["input_size"] and result["output_size"]:
-                pct = (1 - result["output_size"] / result["input_size"]) * 100
-                sign = "-" if pct >= 0 else "+"
-                ratio = f" ({sign}{abs(pct):.1f}%)"
+        # 线程安全计数器
+        _lock = threading.Lock()
+        _success_count = 0
+        _error_count = 0
+        _delete_count = 0
+        _total_input_size = 0
+        _total_output_size = 0
 
-            source_tag = {
-                "comfyui": " [ComfyUI]",
-                "webui": " [WebUI]",
-                "unknown": "",
-            }.get(result.get("source", ""), "")
+        def _process_one(task_item):
+            nonlocal _success_count, _error_count, _delete_count, _total_input_size, _total_output_size
+            idx, fpath, opath = task_item
 
-            print(f" ✅ → {os.path.basename(out_path)}{source_tag}{ratio}")
-            success_count += 1
-            total_input_size += result.get("input_size", 0)
-            total_output_size += result.get("output_size", 0)
+            result = convert_image(
+                input_path=fpath,
+                output_path=opath,
+                quality=args.quality,
+                lossless=args.lossless,
+                method=args.method,
+                bg_color=bg_color,
+            )
 
-            # ---- 删除原文件 ----
-            if args.delete != "off":
-                if delete_original(file_path, args.delete):
-                    delete_count += 1
-                    print(f"    🗑️  原文件已{'移至回收站' if args.delete == 'recycle' else '永久删除'}")
+            with _lock:
+                if result["success"]:
+                    ratio_str = ""
+                    if result["input_size"] and result["output_size"]:
+                        pct = (1 - result["output_size"] / result["input_size"]) * 100
+                        sign = "-" if pct >= 0 else "+"
+                        ratio_str = f" ({sign}{abs(pct):.1f}%)"
+
+                    source_tag = {
+                        "comfyui": " [ComfyUI]",
+                        "webui": " [WebUI]",
+                        "unknown": "",
+                    }.get(result.get("source", ""), "")
+
+                    print(f"  ✅  [{idx}/{total_files}] {os.path.basename(opath)}{source_tag}{ratio_str}")
+                    _success_count += 1
+                    _total_input_size += result.get("input_size", 0)
+                    _total_output_size += result.get("output_size", 0)
+
+                    if result.get("warning"):
+                        print(f"    ⚠️  {result['warning']}")
+
+                    # ------ 转换成功，立即删除原文件 ------
+                    if args.delete != "off":
+                        if delete_original(fpath, args.delete):
+                            _delete_count += 1
+                            print(f"    🗑️  [{idx}/{total_files}] 原文件已{'移至回收站' if args.delete == 'recycle' else '永久删除'}")
                 else:
-                    print(f"    ⚠️  原文件删除失败")
+                    print(f"  ❌  [{idx}/{total_files}] {fpath} — {result['error']}")
+                    _error_count += 1
 
-            if result.get("warning"):
-                print(f"    ⚠️  {result['warning']}")
-        else:
-            print(f" ❌ {result['error']}")
-            error_count += 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(_process_one, tasks))
+
+        success_count = _success_count
+        error_count = _error_count
+        delete_count = _delete_count
+        total_input_size = _total_input_size
+        total_output_size = _total_output_size
 
     # ---- 输出统计 ----
+    elapsed = time.time() - _start_time
+    # 格式化耗时
+    if elapsed < 60:
+        elapsed_str = f"{elapsed:.1f} 秒"
+    else:
+        minutes = int(elapsed // 60)
+        seconds = elapsed % 60
+        elapsed_str = f"{minutes} 分 {seconds:.0f} 秒"
+
     print(f"\n{'=' * 60}")
     print(f"  📊 处理完成:")
     print(f"     ✅ 成功: {success_count}")
     print(f"     ⏭️  跳过: {skip_count}")
     print(f"     ❌ 失败: {error_count}")
+    print(f"     ⏱️  耗时: {elapsed_str}")
     if delete_count:
         print(f"     🗑️  已删除: {delete_count}")
     if success_count and total_input_size > 0:
