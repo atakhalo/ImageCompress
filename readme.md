@@ -11,6 +11,7 @@
   - WebUI: `parameters` → EXIF UserComment
 - ✅ 支持有损/无损压缩
 - ✅ 支持自定义输出目录，**不覆盖原文件**
+- ✅ 同名不同后缀的文件自动区分命名（如 `a.png` → `a.png.webp`），不会互相覆盖
 - ✅ 跳过已转换的文件（--skip-existing）
 - ✅ 默认保留目录结构（使用 `--flat` 禁用）
 - ✅ 未处理的 WebP 文件自动复制到输出目录
@@ -104,6 +105,19 @@ python ImageCompress.py ./images --output ./webp --ignore ./images/screenshots -
 | `--delete` | 删除原文件: `off`=不删除, `recycle`=移至回收站, `permanent`=永久删除（默认: off） |
 | `--bg-color` | RGBA 转 RGB 时的背景色，格式 R,G,B（默认：255,255,255） |
 | `--dry-run` | 仅扫描预览，不执行转换 |
+
+## 输出命名规则
+
+- 默认使用 `原文件名.webp`，例如 `photo.png` → `photo.webp`。
+- 同一次运行中有多个文件会写入同一路径时（例如同一目录下同时存在 `a.png`、`a.jpg`、
+  `a.bmp`，或使用 `--flat` 后不同目录存在同名文件），会自动区分命名，避免互相覆盖：
+  - 本身已是 WebP 的输入优先保留简洁名：`a.webp`
+  - 其余输入在文件名中保留原扩展名：`a.png.webp`、`a.jpg.webp`
+  - 仍然冲突时追加序号：`a_2.png.webp`
+- 不会覆盖输入目录中的原始文件。原地转换时若同名 WebP 已存在，例如源目录同时有
+  `1.jpg` 和 `1.webp`，`1.jpg` 会输出为 `1.jpg.webp`，不会覆盖 `1.webp`；
+  重跑时仍沿用同一输出名，不会叠加序号。
+- 运行日志和 `--dry-run` 预览都会提示哪些文件因同名冲突被改名。
 
 ## 元数据存储格式
 

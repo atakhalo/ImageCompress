@@ -270,8 +270,35 @@ def preserve_timestamps(src_path: str, dst_path: str):
                 def time_to_filetime(t):
                     return int(t * hundred_ns + epoch_as_filetime)
 
-                handle = ctypes.windll.kernel32.CreateFileW(
-                    dst_path,
+                def make_filetime(t):
+                    value = time_to_filetime(t)
+                    ft = wintypes.FILETIME()
+                    ft.dwLowDateTime = value & 0xFFFFFFFF
+                    ft.dwHighDateTime = (value >> 32) & 0xFFFFFFFF
+                    return ft
+
+                # 显式声明原型，避免 64 位句柄被默认 restype 截断
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                create_file = kernel32.CreateFileW
+                create_file.argtypes = [
+                    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+                ]
+                create_file.restype = wintypes.HANDLE
+                set_file_time = kernel32.SetFileTime
+                set_file_time.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.POINTER(wintypes.FILETIME),
+                    ctypes.POINTER(wintypes.FILETIME),
+                    ctypes.POINTER(wintypes.FILETIME),
+                ]
+                set_file_time.restype = wintypes.BOOL
+                close_handle = kernel32.CloseHandle
+                close_handle.argtypes = [wintypes.HANDLE]
+                close_handle.restype = wintypes.BOOL
+
+                handle = create_file(
+                    str(dst_path),
                     0x40000000,  # GENERIC_WRITE
                     0x3,         # FILE_SHARE_READ | FILE_SHARE_WRITE
                     None,
@@ -279,17 +306,18 @@ def preserve_timestamps(src_path: str, dst_path: str):
                     0,           # FILE_ATTRIBUTE_NORMAL
                     None,
                 )
-                if handle != -1 and handle is not None:
-                    ctime = ctypes.c_longlong(time_to_filetime(stat_info.st_ctime))
-                    atime = ctypes.c_longlong(time_to_filetime(stat_info.st_atime))
-                    mtime = ctypes.c_longlong(time_to_filetime(stat_info.st_mtime))
-                    ctypes.windll.kernel32.SetFileTime(
+                invalid_handle = ctypes.c_void_p(-1).value
+                if handle and handle != invalid_handle:
+                    ctime = make_filetime(stat_info.st_ctime)
+                    atime = make_filetime(stat_info.st_atime)
+                    mtime = make_filetime(stat_info.st_mtime)
+                    set_file_time(
                         handle,
                         ctypes.byref(ctime),
                         ctypes.byref(atime),
                         ctypes.byref(mtime),
                     )
-                    ctypes.windll.kernel32.CloseHandle(handle)
+                    close_handle(handle)
             except Exception:
                 pass  # 创建时间设置失败不阻塞流程
     except Exception:
@@ -379,19 +407,19 @@ def convert_image(
         result["error"] = f"无法打开图片: {e}"
         return result
 
-    # ---- 提取元数据 ----
-    metadata = extract_metadata(image)
-    result["source"] = metadata["source"]
-
-    # ---- 处理图片模式 ----
     try:
-        image = prepare_image_for_webp(image, bg_color)
-    except Exception as e:
-        result["error"] = f"图片模式转换失败: {e}"
-        return result
+        # ---- 提取元数据 ----
+        metadata = extract_metadata(image)
+        result["source"] = metadata["source"]
 
-    # ---- 构建 EXIF 并保存为 WebP ----
-    try:
+        # ---- 处理图片模式 ----
+        try:
+            prepared = prepare_image_for_webp(image, bg_color)
+        except Exception as e:
+            result["error"] = f"图片模式转换失败: {e}"
+            return result
+
+        # ---- 构建 EXIF 并保存为 WebP ----
         # 确保输出目录存在
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
@@ -399,7 +427,7 @@ def convert_image(
         exif_dict = build_exif_from_metadata(metadata)
         exif_bytes = piexif.dump(exif_dict)
 
-        image.save(
+        prepared.save(
             output_path,
             format="WEBP",
             quality=quality,
@@ -410,6 +438,12 @@ def convert_image(
     except Exception as e:
         result["error"] = f"保存 WebP 失败: {e}"
         return result
+    finally:
+        # 及时关闭源文件句柄，避免 Windows 上后续删除/移动原文件失败
+        try:
+            image.close()
+        except Exception:
+            pass
 
     try:
         result["output_size"] = os.path.getsize(output_path)
@@ -503,13 +537,15 @@ def scan_images(input_path: str, recursive: bool = True, format_filter: set = No
         return []
 
     files = []
+    # 转义基目录中的 glob 特殊字符（如 "[" "]"），避免路径被当作通配符
+    base_pattern = glob.escape(str(path))
     for ext in exts_to_scan:
         if recursive:
-            pattern = str(path / "**" / f"*{ext}")
-            pattern_upper = str(path / "**" / f"*{ext.upper()}")
+            pattern = os.path.join(base_pattern, "**", f"*{ext}")
+            pattern_upper = os.path.join(base_pattern, "**", f"*{ext.upper()}")
         else:
-            pattern = str(path / f"*{ext}")
-            pattern_upper = str(path / f"*{ext.upper()}")
+            pattern = os.path.join(base_pattern, f"*{ext}")
+            pattern_upper = os.path.join(base_pattern, f"*{ext.upper()}")
         files.extend(glob.glob(pattern, recursive=recursive))
         files.extend(glob.glob(pattern_upper, recursive=recursive))
 
@@ -591,6 +627,187 @@ def get_output_path_preserve_structure(
 
     new_name = input_path.stem + target_ext
     return str(output_base / rel_path.parent / new_name)
+
+
+def _path_key(path: str) -> str:
+    """用于判断两个路径是否指向同一文件的归一化键 (Windows 下大小写不敏感)。"""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def assign_output_paths(
+    entries: list,
+    target_ext: str = ".webp",
+    protected_inputs: set = None,
+) -> None:
+    """
+    就地解决输出路径冲突（CLI 与 GUI 共用）。
+
+    entries 中每个字典必须包含:
+        input  : 输入文件路径
+        output : 基础输出路径 (stem + target_ext)
+    处理后写入:
+        output : 最终输出路径（冲突时改名）
+        renamed: 是否因同名冲突改过名
+
+    protected_inputs: 归一化后的输入文件路径集合，输出不得覆盖其中除自身以外的
+                      文件；但带原扩展名的产物名（如 1.jpg.webp）允许覆盖，
+                      以保证原地重跑时产物名稳定。
+
+    规则:
+        - 只有一个输入映射到某个输出时，保持原名 (a.png -> a.webp)。
+        - 多个输入映射到同一输出时（同名不同后缀、--flat 下跨目录同名）:
+            * 本身已是目标格式的输入优先使用简洁名 (a.webp)；
+            * 其余输入在文件名中保留原扩展名 (a.png -> a.png.webp)，
+              避免结果依赖扫描/线程顺序；
+            * 仍然冲突时追加序号 (a.png.webp / a_2.png.webp)。
+    """
+    protected_inputs = protected_inputs or set()
+    groups = {}
+    order = []
+    for entry in entries:
+        key = _path_key(entry["output"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(entry)
+
+    # 所有基础输出路径都会被本次运行占用，改名时必须避开其它组的名字
+    reserved = set(order)
+
+    def _sort_key(entry):
+        src_ext = Path(entry["input"]).suffix.lower()
+        return (0 if src_ext == target_ext else 1, entry["input"].lower())
+
+    for key in order:
+        members = groups[key]
+        base = members[0]["output"]
+        parent = os.path.dirname(base)
+        stem = Path(base).stem
+        multiple = len(members) > 1
+        taken = set()
+
+        for entry in sorted(members, key=_sort_key):
+            src_ext = Path(entry["input"]).suffix.lower()
+            own_key = _path_key(entry["input"])
+            candidates = []
+
+            if src_ext == target_ext:
+                # 本身已是目标格式：简洁名优先
+                candidates.append(os.path.join(parent, stem + target_ext))
+                candidates += [
+                    os.path.join(parent, f"{stem}_{n}{target_ext}")
+                    for n in range(2, 101)
+                ]
+            else:
+                tag = src_ext.lstrip(".") or "src"
+                if multiple:
+                    # 同名多源：一律保留原扩展名，命名与扫描顺序无关
+                    candidates.append(os.path.join(parent, f"{stem}.{tag}{target_ext}"))
+                    candidates += [
+                        os.path.join(parent, f"{stem}_{n}.{tag}{target_ext}")
+                        for n in range(2, 101)
+                    ]
+                else:
+                    # 单源：优先简洁名，其次保留原扩展名
+                    candidates.append(os.path.join(parent, stem + target_ext))
+                    candidates.append(os.path.join(parent, f"{stem}.{tag}{target_ext}"))
+                    candidates += [
+                        os.path.join(parent, f"{stem}_{n}.{tag}{target_ext}")
+                        for n in range(2, 101)
+                    ]
+
+            for candidate in candidates:
+                cand_key = _path_key(candidate)
+                if cand_key in taken:
+                    continue
+                # 不能抢占其它组的输出名
+                if cand_key in reserved and cand_key != key:
+                    continue
+                # 不能覆盖本次扫描到的其它输入文件。
+                # 但带原扩展名的产物名（如 1.jpg -> 1.jpg.webp）是本工具生成的，
+                # 重跑时允许覆盖它，否则每次运行都会产生新序号。
+                tagged = Path(candidate).stem.lower().endswith(src_ext)
+                if cand_key in protected_inputs and cand_key != own_key and not tagged:
+                    continue
+                taken.add(cand_key)
+                entry["output"] = candidate
+                entry["renamed"] = cand_key != key
+                break
+            else:
+                # 兜底：所有候选都不可用，保持基础名
+                entry["renamed"] = False
+
+
+def plan_file_operations(
+    files: list,
+    input_path: str,
+    input_is_file: bool,
+    output_dir: str,
+    flat: bool = False,
+    skip_existing: bool = False,
+    ignore_patterns: list = None,
+    ignore_mode: str = "skip",
+    lossless: bool = False,
+    target_ext: str = ".webp",
+) -> list:
+    """
+    为扫描到的文件规划输出路径与处理动作（CLI 与 GUI 共用，保证两边行为一致）。
+
+    返回列表，每项包含:
+        index   : 序号 (从 1 开始)
+        input   : 输入文件路径
+        output  : 最终输出路径
+        action  : convert / copy_webp / copy_ignore / skip_existing / skip_webp
+        renamed : 输出名是否因同名冲突而改变
+    """
+    ignore_patterns = ignore_patterns or []
+    plans = []
+    writers = []
+
+    for idx, file_path in enumerate(files, 1):
+        if not flat and not input_is_file:
+            base_output = get_output_path_preserve_structure(
+                file_path, input_path, output_dir, target_ext
+            )
+        else:
+            base_output = get_output_path(file_path, output_dir, target_ext)
+
+        plan = {
+            "index": idx,
+            "input": file_path,
+            "output": base_output,
+            "action": "convert",
+            "renamed": False,
+        }
+
+        # 忽略路径 (copy 模式：跳过但复制)
+        if ignore_patterns and ignore_mode == "copy" and \
+                is_matched_ignore(file_path, ignore_patterns):
+            plan["action"] = "copy_ignore"
+        # 跳过目标格式自身
+        elif file_path.lower().endswith(target_ext) and not lossless:
+            if _path_key(base_output) == _path_key(file_path):
+                plan["action"] = "skip_webp"
+            else:
+                plan["action"] = "copy_webp"
+
+        plans.append(plan)
+        if plan["action"] in ("convert", "copy_webp", "copy_ignore"):
+            writers.append(plan)
+
+    # 解决本次运行内部的同名冲突
+    # 本次扫描到的输入文件都视为不可覆盖：原地转换时也不能覆盖已存在的同名 WebP
+    # (例如 1.jpg 转换时不能覆盖 1.webp，改用 1.jpg.webp)
+    protected = {_path_key(f) for f in files}
+    assign_output_paths(writers, target_ext=target_ext, protected_inputs=protected)
+
+    # 冲突改名后再判断：跳过已存在的目标文件
+    if skip_existing:
+        for plan in writers:
+            if os.path.exists(plan["output"]):
+                plan["action"] = "skip_existing"
+
+    return plans
 
 
 # ============================================================
@@ -776,11 +993,37 @@ def main():
     print(f"  🧵 并行线程: {workers}" if workers > 1 else f"  🧵 单线程处理")
     print(f"{'=' * 60}")
 
+    # ---- 规划输出路径与处理动作（含同名冲突消解）----
+    plans = plan_file_operations(
+        files,
+        input_path,
+        input_is_file,
+        output_dir,
+        flat=args.flat,
+        skip_existing=args.skip_existing,
+        ignore_patterns=args.ignore,
+        ignore_mode=args.ignore_mode,
+        lossless=args.lossless,
+    )
+
     if args.dry_run:
         print("\n  📋 预览模式 (--dry-run)，未执行转换:")
-        for f in files:
-            print(f"    · {f}")
-        print(f"\n  ✅ 共 {len(files)} 个文件待处理")
+        for plan in plans:
+            rel_in = (
+                os.path.relpath(plan["input"], input_path)
+                if not input_is_file else os.path.basename(plan["input"])
+            )
+            if plan["action"] in ("skip_existing", "skip_webp"):
+                print(f"    ⏭️ {rel_in} (跳过)")
+            else:
+                note = "  [同名冲突，已改名]" if plan["renamed"] else ""
+                rel_out = os.path.relpath(plan["output"], output_dir)
+                print(f"    · {rel_in} → {rel_out}{note}")
+        pending = [p for p in plans if p["action"] not in ("skip_existing", "skip_webp")]
+        summary = f"\n  ✅ 共 {len(pending)} 个文件待处理"
+        if len(plans) > len(pending):
+            summary += f"（{len(plans) - len(pending)} 个跳过）"
+        print(summary)
         return
 
     # ---- 计时开始 ----
@@ -791,25 +1034,35 @@ def main():
     skip_count = 0
     total_files = len(files)
 
-    for idx, file_path in enumerate(files, 1):
-        # 确定输出路径
-        if not args.flat and not input_is_file:
-            out_path = get_output_path_preserve_structure(
-                file_path, input_path, output_dir
-            )
-        else:
-            out_path = get_output_path(file_path, output_dir)
-
-        output_differs = os.path.normcase(os.path.abspath(out_path)) != os.path.normcase(os.path.abspath(file_path))
+    for plan in plans:
+        idx = plan["index"]
+        file_path = plan["input"]
+        out_path = plan["output"]
+        action = plan["action"]
 
         # 跳过已存在的文件
-        if args.skip_existing and os.path.exists(out_path):
+        if action == "skip_existing":
             print(f"  ⏭️  [{idx}/{total_files}] 跳过 (已存在): {file_path}")
             skip_count += 1
             continue
 
+        # 跳过目标格式自身
+        if action == "skip_webp":
+            print(f"  ⏭️  [{idx}/{total_files}] 跳过 (已是 WebP): {file_path}")
+            skip_count += 1
+            continue
+
+        if plan["renamed"]:
+            display_in = (
+                os.path.relpath(file_path, input_path)
+                if not input_is_file else os.path.basename(file_path)
+            )
+            display_out = os.path.relpath(out_path, output_dir)
+            print(f"  ⚠️  [{idx}/{total_files}] 同名冲突，输出改名: "
+                  f"{display_in} → {display_out}")
+
         # 忽略路径 (copy 模式：跳过但复制)
-        if args.ignore and args.ignore_mode == "copy" and is_matched_ignore(file_path, args.ignore):
+        if action == "copy_ignore":
             os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
             shutil.copy2(file_path, out_path)
             preserve_timestamps(file_path, out_path)
@@ -817,20 +1070,24 @@ def main():
             skip_count += 1
             continue
 
-        # 跳过目标格式自身
-        if file_path.lower().endswith(".webp") and not args.lossless:
-            if output_differs:
-                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                shutil.copy2(file_path, out_path)
-                preserve_timestamps(file_path, out_path)
-                print(f"  📋  [{idx}/{total_files}] 复制 (已是 WebP): {file_path}")
-            else:
-                print(f"  ⏭️  [{idx}/{total_files}] 跳过 (已是 WebP): {file_path}")
+        # 已是 WebP，但目标路径不同：复制到输出目录
+        if action == "copy_webp":
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            shutil.copy2(file_path, out_path)
+            preserve_timestamps(file_path, out_path)
+            print(f"  📋  [{idx}/{total_files}] 复制 (已是 WebP): {file_path}")
             skip_count += 1
             continue
 
         # 加入转换任务
         tasks.append((idx, file_path, out_path))
+
+    # 统计变量先初始化，避免 tasks 为空时未定义
+    success_count = 0
+    error_count = 0
+    delete_count = 0
+    total_input_size = 0
+    total_output_size = 0
 
     # ---- 并行转换 ----
     if not tasks:

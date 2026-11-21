@@ -16,8 +16,8 @@ from tkinter import ttk, filedialog, messagebox
 from ImageCompress import (
     scan_images,
     convert_image,
-    get_output_path,
-    get_output_path_preserve_structure,
+    plan_file_operations,
+    is_matched_ignore,
     preserve_timestamps,
     delete_original,
     format_size,
@@ -311,27 +311,6 @@ class ImageCompressGUI:
         if path:
             self.source_path.set(path)
 
-    def _is_matched_ignore(self, file_path: str, ignore_patterns: list) -> bool:
-        """检查 file_path 是否匹配任意忽略模式"""
-        if not ignore_patterns:
-            return False
-        normalized_path = os.path.normcase(os.path.abspath(file_path))
-        for pattern in ignore_patterns:
-            if not pattern:
-                continue
-            # 统一路径分隔符: 将 / 替换为系统分隔符，再统一大小写
-            norm_pattern = os.path.normcase(pattern.replace("/", os.sep))
-            if os.path.isabs(norm_pattern):
-                if normalized_path == norm_pattern or normalized_path.startswith(norm_pattern + os.sep):
-                    return True
-                # 绝对路径也尝试子串匹配 (处理不同驱动器等场景)
-                if norm_pattern in normalized_path:
-                    return True
-            else:
-                if norm_pattern in normalized_path:
-                    return True
-        return False
-
     def _browse_source_file(self):
         path = filedialog.askopenfilename(
             title="选择源文件",
@@ -390,16 +369,57 @@ class ImageCompressGUI:
             self.log.append("📭 未找到支持的图片文件", "error")
             return
 
+        input_is_file = os.path.isfile(source)
         output_dir = self._get_output_dir(source)
+        ignore_paths = list(self.ignore_paths)
+        ignore_mode = self.ignore_mode.get()
+
+        # 忽略模式为「直接跳过」时先过滤，与转换逻辑保持一致
+        if ignore_paths and ignore_mode == "skip":
+            before = len(files)
+            files = [f for f in files if not is_matched_ignore(f, ignore_paths)]
+            filtered = before - len(files)
+            if filtered:
+                self.log.append(f"  🚫 忽略路径过滤: 移除了 {filtered} 个文件", "info")
+            if not files:
+                self.log.append("📭 所有文件均被忽略路径排除", "error")
+                return
+
+        plans = plan_file_operations(
+            files,
+            source,
+            input_is_file,
+            output_dir,
+            flat=self.flat_mode.get(),
+            skip_existing=self.skip_existing.get(),
+            ignore_patterns=ignore_paths,
+            ignore_mode=ignore_mode,
+            lossless=self.lossless.get(),
+        )
+
         self.log.append(f"📁 源路径: {os.path.abspath(source)}", "info")
         self.log.append(f"📂 输出目录: {os.path.abspath(output_dir)}", "info")
         self.log.append(f"🔍 找到 {len(files)} 个图片文件", "info")
         self.log.append("")
 
-        for f in files:
-            self.log.append(f"  · {os.path.relpath(f, source) if os.path.isdir(source) else os.path.basename(f)}", "info")
+        pending = 0
+        skip_preview = 0
+        for plan in plans:
+            rel_in = (os.path.relpath(plan["input"], source)
+                      if not input_is_file else os.path.basename(plan["input"]))
+            if plan["action"] in ("skip_existing", "skip_webp"):
+                self.log.append(f"  ⏭️ {rel_in} (跳过)", "skip")
+                skip_preview += 1
+                continue
+            note = "  [同名冲突，已改名]" if plan["renamed"] else ""
+            rel_out = os.path.relpath(plan["output"], output_dir)
+            self.log.append(f"  · {rel_in} → {rel_out}{note}", "info")
+            pending += 1
 
-        self.log.append(f"\n✅ 共 {len(files)} 个文件待处理", "info")
+        summary = f"\n✅ 共 {pending} 个文件待处理"
+        if skip_preview:
+            summary += f"，{skip_preview} 个跳过"
+        self.log.append(summary, "info")
         self.status_var.set(f"预览完成: {len(files)} 个文件")
 
     # -------- 转换核心 --------
@@ -487,7 +507,7 @@ class ImageCompressGUI:
             # ---- 忽略路径过滤 (skip 模式：扫描阶段直接移除) ----
             if ignore_paths and ignore_mode == "skip":
                 before = len(files)
-                files = [f for f in files if not self._is_matched_ignore(f, ignore_paths)]
+                files = [f for f in files if not is_matched_ignore(f, ignore_paths)]
                 filtered = before - len(files)
                 if filtered:
                     self._append_log(f"  🚫 忽略路径过滤: 移除了 {filtered} 个文件", "info")
@@ -514,39 +534,66 @@ class ImageCompressGUI:
                 self._append_log(f"  🚫  忽略路径 (跳过并复制):", "info")
                 for p in ignore_paths:
                     self._append_log(f"       · {p}", "info")
-            workers = self.workers.get()
+            try:
+                workers = int(self.workers.get())
+            except Exception:
+                workers = os.cpu_count() or 4
+            workers = max(1, workers)
             self._append_log(f"  🧵 并行线程: {workers}" if workers > 1 else f"  🧵 单线程处理", "info")
 
             # ---- 计时开始 ----
             _start_time = time.time()
 
+            # ---- 规划输出路径（含同名冲突消解）----
+            plans = plan_file_operations(
+                files,
+                source,
+                input_is_file,
+                output_dir,
+                flat=flat,
+                skip_existing=skip_existing,
+                ignore_patterns=ignore_paths,
+                ignore_mode=ignore_mode,
+                lossless=lossless,
+            )
+
             # ---- 构建任务列表（串行，过滤跳过/忽略/复制）----
             tasks = []
             total_files = len(files)
 
-            for idx, file_path in enumerate(files, 1):
+            for plan in plans:
                 if self.cancel_requested:
                     break
 
-                # 确定输出路径
-                if not flat and not input_is_file:
-                    out_path = get_output_path_preserve_structure(
-                        file_path, source, output_dir
-                    )
-                else:
-                    out_path = get_output_path(file_path, output_dir)
-
-                output_differs = os.path.normcase(os.path.abspath(out_path)) != os.path.normcase(os.path.abspath(file_path))
-                rel = os.path.relpath(file_path, source) if os.path.isdir(source) else os.path.basename(file_path)
+                idx = plan["index"]
+                file_path = plan["input"]
+                out_path = plan["output"]
+                action = plan["action"]
+                rel = (os.path.relpath(file_path, source)
+                       if os.path.isdir(source) else os.path.basename(file_path))
 
                 # 跳过已存在的文件
-                if skip_existing and os.path.exists(out_path):
+                if action == "skip_existing":
                     self._append_log(f"  ⏭️  [{idx}/{total_files}] 跳过 (已存在): {rel}", "skip")
                     skip_count += 1
                     continue
 
+                # 跳过目标格式自身
+                if action == "skip_webp":
+                    self._append_log(f"  ⏭️  [{idx}/{total_files}] 跳过 (已是 WebP): {rel}", "skip")
+                    skip_count += 1
+                    continue
+
+                # 同名冲突改名提示
+                if plan["renamed"]:
+                    rel_out = os.path.relpath(out_path, output_dir)
+                    self._append_log(
+                        f"  ⚠️  [{idx}/{total_files}] 同名冲突，输出改名: {rel} → {rel_out}",
+                        "skip",
+                    )
+
                 # 忽略路径 (copy 模式：跳过但复制)
-                if ignore_paths and ignore_mode == "copy" and self._is_matched_ignore(file_path, ignore_paths):
+                if action == "copy_ignore":
                     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
                     shutil.copy2(file_path, out_path)
                     preserve_timestamps(file_path, out_path)
@@ -554,15 +601,12 @@ class ImageCompressGUI:
                     skip_count += 1
                     continue
 
-                # 跳过目标格式自身
-                if file_path.lower().endswith(".webp") and not lossless:
-                    if output_differs:
-                        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                        shutil.copy2(file_path, out_path)
-                        preserve_timestamps(file_path, out_path)
-                        self._append_log(f"  📋  [{idx}/{total_files}] 复制 (已是 WebP): {rel}", "copy")
-                    else:
-                        self._append_log(f"  ⏭️  [{idx}/{total_files}] 跳过 (已是 WebP): {rel}", "skip")
+                # 已是 WebP，但目标路径不同：复制到输出目录
+                if action == "copy_webp":
+                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                    shutil.copy2(file_path, out_path)
+                    preserve_timestamps(file_path, out_path)
+                    self._append_log(f"  📋  [{idx}/{total_files}] 复制 (已是 WebP): {rel}", "copy")
                     skip_count += 1
                     continue
 
